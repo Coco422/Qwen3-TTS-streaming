@@ -17,7 +17,7 @@ import base64
 import io
 import urllib.request
 from dataclasses import dataclass
-from typing import Any, Dict, Generator, List, Optional, Tuple, Union
+from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple, Union
 from urllib.parse import urlparse
 
 import librosa
@@ -49,6 +49,85 @@ class VoiceClonePromptItem:
     x_vector_only_mode: bool
     icl_mode: bool
     ref_text: Optional[str] = None
+
+
+class _RealtimeTextHiddenProvider:
+    def __init__(
+        self,
+        owner: "Qwen3TTSModel",
+        text_chunks: Iterable[str],
+        initial_text: str,
+        initial_body_ids: torch.Tensor,
+        source_done: bool = False,
+    ):
+        self.owner = owner
+        self.text_iter = iter(text_chunks)
+        self.text = initial_text
+        self.body_ids = initial_body_ids.detach().clone()
+        self.source_done = source_done
+        self.hidden: Optional[torch.Tensor] = None
+
+    def _body_ids_for_text(self, text: str) -> torch.Tensor:
+        input_id = self.owner._tokenize_texts([self.owner._build_assistant_text(text)])[0]
+        return input_id[:, 3:-5]
+
+    def _build_hidden(self, template: torch.Tensor) -> torch.Tensor:
+        tail_ids = self.body_ids[:, 1:]
+        parts = []
+        if tail_ids.shape[1] > 0:
+            parts.append(
+                self.owner.model.talker.text_projection(
+                    self.owner.model.talker.get_text_embeddings()(tail_ids)
+                )
+            )
+        if self.source_done:
+            eos_id = torch.tensor(
+                [[self.owner.model.config.tts_eos_token_id]],
+                device=self.owner.model.talker.device,
+                dtype=self.body_ids.dtype,
+            )
+            parts.append(
+                self.owner.model.talker.text_projection(
+                    self.owner.model.talker.get_text_embeddings()(eos_id)
+                )
+            )
+        if not parts:
+            return template[:, :0, :]
+        return torch.cat(parts, dim=1)
+
+    def _pull_next_chunk(self, template: torch.Tensor) -> None:
+        try:
+            chunk = next(self.text_iter)
+        except StopIteration:
+            self.source_done = True
+            self.hidden = self._build_hidden(template)
+            return
+
+        if not chunk:
+            return
+
+        self.text += chunk
+        new_body_ids = self._body_ids_for_text(self.text)
+        old_tokens = self.body_ids[0].tolist()
+        new_tokens = new_body_ids[0].tolist()
+        if new_tokens[:len(old_tokens)] != old_tokens:
+            raise RuntimeError(
+                "Realtime TTS tokenizer prefix changed after audio generation started. "
+                "For this prototype, feed stable text deltas such as CJK characters or "
+                "a tokenizer-stable queue."
+            )
+        self.body_ids = new_body_ids
+        self.hidden = self._build_hidden(template)
+
+    def __call__(self, required_step: int, current_hidden: torch.Tensor) -> torch.Tensor:
+        if self.hidden is None:
+            self.hidden = self._build_hidden(current_hidden)
+        if required_step < 0:
+            return self.hidden
+
+        while required_step >= self.hidden.shape[1] and not self.source_done:
+            self._pull_next_chunk(current_hidden)
+        return self.hidden
 
 
 class Qwen3TTSModel:
@@ -819,6 +898,125 @@ class Qwen3TTSModel:
             first_chunk_frames=first_chunk_frames,
             repetition_penalty=repetition_penalty,
             repetition_penalty_window=repetition_penalty_window,
+            **gen_kwargs,
+        ):
+            yield chunk, sr
+
+    @torch.inference_mode()
+    def stream_generate_voice_clone_realtime(
+        self,
+        text_chunks: Iterable[str],
+        language: str = None,
+        ref_audio: Optional[AudioLike] = None,
+        ref_text: Optional[str] = None,
+        x_vector_only_mode: bool = True,
+        voice_clone_prompt: Optional[Union[Dict[str, Any], VoiceClonePromptItem, List[VoiceClonePromptItem]]] = None,
+        # Streaming control
+        emit_every_frames: int = 8,
+        decode_window_frames: int = 80,
+        overlap_samples: int = 512,
+        max_frames: int = 10000,
+        # Optimization
+        use_optimized_decode: bool = True,
+        # Two-phase streaming: aggressive first chunk
+        first_chunk_emit_every: int = 0,
+        first_chunk_decode_window: int = 48,
+        first_chunk_frames: int = 48,
+        # Repetition penalty window
+        repetition_penalty_window: int = 100,
+        repetition_penalty: float = 1.0,
+        **kwargs,
+    ) -> Generator[Tuple[np.ndarray, int], None, None]:
+        """
+        Stream voice clone speech from appendable text chunks.
+
+        Unlike stream_generate_voice_clone(text=...), this method starts after the
+        first tokenizer-visible text token and lets the generation loop wait for
+        more text hidden states when it catches up to the LLM stream.
+        """
+        if self.model.tts_model_type != "base":
+            raise ValueError(
+                f"model with tts_model_type={self.model.tts_model_type} "
+                "does not support stream_generate_voice_clone_realtime"
+            )
+
+        language = language if language is not None else "Auto"
+        self._validate_languages([language])
+
+        if voice_clone_prompt is None:
+            if ref_audio is None:
+                raise ValueError("Either voice_clone_prompt or ref_audio must be provided")
+            prompt_items = self.create_voice_clone_prompt(
+                ref_audio=ref_audio,
+                ref_text=ref_text,
+                x_vector_only_mode=x_vector_only_mode,
+            )
+            voice_clone_prompt_dict = self._prompt_items_to_voice_clone_prompt(prompt_items)
+        elif isinstance(voice_clone_prompt, VoiceClonePromptItem):
+            voice_clone_prompt_dict = self._prompt_items_to_voice_clone_prompt([voice_clone_prompt])
+        elif isinstance(voice_clone_prompt, list):
+            if len(voice_clone_prompt) != 1:
+                raise ValueError("stream_generate_voice_clone_realtime only supports one voice prompt")
+            voice_clone_prompt_dict = self._prompt_items_to_voice_clone_prompt(voice_clone_prompt)
+        else:
+            voice_clone_prompt_dict = voice_clone_prompt
+
+        if any(voice_clone_prompt_dict.get("icl_mode") or []):
+            raise ValueError(
+                "stream_generate_voice_clone_realtime currently requires x_vector_only_mode=True. "
+                "ICL/ref-code prompting consumes target text during prefill and is not appendable yet."
+            )
+
+        source_iter = iter(text_chunks)
+        initial_text = ""
+        first_input_id = None
+        body_ids = None
+        while body_ids is None or body_ids.shape[1] == 0:
+            try:
+                chunk = next(source_iter)
+            except StopIteration:
+                raise ValueError("text_chunks ended before yielding any tokenizer-visible text")
+            if not chunk:
+                continue
+            initial_text += chunk
+            first_input_id = self._tokenize_texts([self._build_assistant_text(initial_text)])[0]
+            body_ids = first_input_id[:, 3:-5]
+
+        initial_input_id = torch.cat(
+            [first_input_id[:, :3], body_ids[:, :1], first_input_id[:, -5:]],
+            dim=1,
+        )
+        text_hidden_provider = _RealtimeTextHiddenProvider(
+            owner=self,
+            text_chunks=source_iter,
+            initial_text=initial_text,
+            initial_body_ids=body_ids,
+        )
+
+        gen_kwargs = self._merge_generate_kwargs(**kwargs)
+        supported_params = {
+            "do_sample", "top_k", "top_p", "temperature",
+            "subtalker_dosample", "subtalker_top_k", "subtalker_top_p", "subtalker_temperature",
+        }
+        gen_kwargs = {k: v for k, v in gen_kwargs.items() if k in supported_params}
+
+        for chunk, sr in self.model.stream_generate_pcm(
+            input_ids=[initial_input_id],
+            ref_ids=None,
+            voice_clone_prompt=voice_clone_prompt_dict,
+            languages=[language],
+            non_streaming_mode=False,
+            emit_every_frames=emit_every_frames,
+            decode_window_frames=decode_window_frames,
+            overlap_samples=overlap_samples,
+            max_frames=max_frames,
+            use_optimized_decode=use_optimized_decode,
+            first_chunk_emit_every=first_chunk_emit_every,
+            first_chunk_decode_window=first_chunk_decode_window,
+            first_chunk_frames=first_chunk_frames,
+            repetition_penalty=repetition_penalty,
+            repetition_penalty_window=repetition_penalty_window,
+            trailing_text_hidden_provider=text_hidden_provider,
             **gen_kwargs,
         ):
             yield chunk, sr

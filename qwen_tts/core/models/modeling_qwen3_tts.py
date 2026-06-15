@@ -2637,6 +2637,8 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         first_chunk_emit_every: int = 0,  # 0 = disabled, use emit_every_frames throughout
         first_chunk_decode_window: int = 48,
         first_chunk_frames: int = 48,  # Switch to stable after this many frames
+        # Realtime text input: optional provider that can grow trailing_text_hiddens
+        trailing_text_hidden_provider: Optional[Callable[[int, torch.Tensor], torch.Tensor]] = None,
     ) -> Generator[tuple[np.ndarray, int], None, None]:
         """
         Stream audio generation, yielding PCM chunks as they are generated.
@@ -2665,6 +2667,9 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             first_chunk_emit_every: Emit interval for first chunk phase (0 = disabled, use emit_every_frames)
             first_chunk_decode_window: Decode window size for first chunk phase
             first_chunk_frames: Switch to stable settings after this many frames
+            trailing_text_hidden_provider: Optional callable for true realtime text input.
+                It receives (required_generation_step, current_trailing_text_hiddens) and must
+                return a tensor whose second dimension may grow as new text arrives.
 
         Yields:
             tuple[np.ndarray, int]: (pcm_chunk as float32 array, sample_rate)
@@ -2680,6 +2685,16 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                 speakers=speakers,
                 non_streaming_mode=non_streaming_mode,
             )
+        if trailing_text_hidden_provider is not None:
+            if talker_input_embeds.shape[0] != 1:
+                raise ValueError("trailing_text_hidden_provider only supports single-sample streaming")
+            trailing_text_hiddens = trailing_text_hidden_provider(-1, trailing_text_hiddens)
+
+        def refresh_trailing_text_hiddens(required_step: int) -> torch.Tensor:
+            nonlocal trailing_text_hiddens
+            if trailing_text_hidden_provider is not None:
+                trailing_text_hiddens = trailing_text_hidden_provider(required_step, trailing_text_hiddens)
+            return trailing_text_hiddens
 
         # Multiple EOS tokens that can terminate generation
         # Some models may emit different EOS tokens depending on context
@@ -2763,6 +2778,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             # Mark step begin for CUDA graphs to avoid tensor overwrite errors
             # This is required when using torch.compile with reduce-overhead mode
             torch.compiler.cudagraph_mark_step_begin()
+            trailing_text_hiddens = refresh_trailing_text_hiddens(generation_step)
 
             # Single-step forward
             step_out = self.talker.forward(

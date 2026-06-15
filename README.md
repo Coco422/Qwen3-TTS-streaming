@@ -15,6 +15,9 @@ Added in this fork:
 - **Hann window crossfade** - click-free chunk boundaries with proper fade-in/fade-out
 - **Repetition penalty for streaming** - prevents token loops that cause looping audio and runaway generation. Defaults to 1.0 (disabled) because streaming generates frame-by-frame with CUDA graph constraints where repetition manifests differently than the non-streaming path (which defaults to 1.05)
 
+Added in Coco422 fork:
+- **Experimental realtime text input** - `stream_generate_voice_clone_realtime()` accepts appendable text chunks, e.g. LLM SSE deltas, and lets the TTS generation loop wait for more text hidden states instead of sentence-boundary chunking. Current prototype supports Base voice clone with `x_vector_only_mode=True`; ICL/ref-code prompting still requires full target text at prefill time.
+
 Experiments on branch: [wip/experimental](https://github.com/rekuenkdr/Qwen3-TTS-streaming/tree/wip/experimental)
 - **`generate_fast()` codebook predictor** - lightweight codebook generation that skips HuggingFace `generate()` overhead for the 31-step autoregressive loop (1.13x faster per-frame)
 - **Manual CUDA graph capture for codebook predictor** - captures the entire 31-step codebook loop as a single CUDA graph replay (2.15x faster per-frame, 12.94ms vs 27.88ms baseline)
@@ -72,6 +75,22 @@ for chunk, sr in model.stream_generate_voice_clone(
     sd.play(chunk, sr)
     sd.wait()
 ```
+
+## Realtime Text Input
+
+```python
+for chunk, sr in model.stream_generate_voice_clone_realtime(
+    text_chunks=llm_sse_text_delta_iterable,
+    language="Auto",
+    voice_clone_prompt=prompt,
+    emit_every_frames=8,
+    decode_window_frames=80,
+    first_chunk_emit_every=5,
+):
+    play(chunk, sr)
+```
+
+This path is intended for LLM SSE to TTS without waiting for punctuation or complete sentences. See `examples/test_realtime_text_stream.py` for a local iterator-based smoke test.
 
 ## Streaming Parameters
 
