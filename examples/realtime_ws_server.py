@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import base64
 import json
+import os
 import sys
 import threading
 import time
@@ -363,7 +364,11 @@ def parse_args():
     parser.add_argument("--llm-base-url", default=None)
     parser.add_argument("--llm-api-key", default=None)
     parser.add_argument("--llm-model", default=None)
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.llm_base_url = args.llm_base_url or os.environ.get("LLM_BASE_URL")
+    args.llm_api_key = args.llm_api_key or os.environ.get("LLM_API_KEY")
+    args.llm_model = args.llm_model or os.environ.get("LLM_MODEL")
+    return args
 
 
 def main():
