@@ -129,9 +129,11 @@ python examples/realtime_ws_server.py \
   --llm-model qwen3.6-27b
 ```
 
-Open `http://127.0.0.1:7860`. The WebSocket accepts Ali-style events including `session.update`, `input_text_buffer.append`, `input_text_buffer.commit`, and `session.finish`; audio streams back as `response.audio.delta` with base64 `pcm_f32le` chunks.
+Open `http://127.0.0.1:7860`. The WebSocket accepts Ali-style events including `session.update`, `input_text_buffer.append`, `input_text_buffer.commit`, and `session.finish`; audio streams back as `response.audio.delta` with base64 `pcm_f32le` chunks. For drop-in Aliyun-style clients, use the compatible path `/api-ws/v1/realtime?model=qwen-tts-realtime`; the demo path `/v1/realtime/tts` remains available.
 
 The demo server enables startup warmup and a small tokenizer-stability front buffer by default. `--initial-buffer-chars 5` waits for only the first few LLM characters before starting TTS; this is not sentence splitting and subsequent LLM deltas keep streaming into the same TTS session. Diagnostic `response.timing.delta` events report model-side milestones such as prefill, first codec frame, and first decode.
+
+For Qwen3 reasoning models served by vLLM, the LLM proxy sends `chat_template_kwargs: {"enable_thinking": false}` by default to keep first-token latency low. Pass `--llm-enable-thinking` only when you explicitly want reasoning output before TTS.
 
 ## Streaming Parameters
 

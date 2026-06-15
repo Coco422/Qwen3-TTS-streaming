@@ -8,6 +8,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
@@ -70,6 +71,7 @@ def _iter_openai_sse(
     model: str,
     messages: Iterable[Dict[str, str]],
     temperature: Optional[float] = None,
+    chat_template_kwargs: Optional[Dict[str, Any]] = None,
 ):
     url = base_url.rstrip("/") + "/v1/chat/completions"
     body: Dict[str, Any] = {
@@ -79,6 +81,8 @@ def _iter_openai_sse(
     }
     if temperature is not None:
         body["temperature"] = temperature
+    if chat_template_kwargs:
+        body["chat_template_kwargs"] = chat_template_kwargs
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
@@ -159,10 +163,14 @@ class RealtimeServer:
         threads = []
         initial_lock = threading.Lock()
         state: Dict[str, Any] = {
+            "session_id": f"session_{uuid.uuid4().hex}",
+            "api_model": websocket.query_params.get("model") or "qwen-tts-realtime",
             "model_mode": self.args.mode,
             "commit_mode": "server_commit",
             "speaker": self.args.speaker,
             "language": self.args.language,
+            "response_format": "pcm_f32le",
+            "sample_rate": 24000,
             "started": False,
             "closed": False,
             "stable_holdback_tokens": self.args.stable_holdback_tokens,
@@ -314,6 +322,7 @@ class RealtimeServer:
                     model=self.args.llm_model,
                     messages=messages,
                     temperature=payload.get("temperature"),
+                    chat_template_kwargs=payload.get("chat_template_kwargs") or self.args.llm_chat_template_kwargs,
                 ):
                     enqueue({"type": "response.text.delta", "delta": delta})
                     append_text_delta(delta)
@@ -332,11 +341,16 @@ class RealtimeServer:
         await websocket.send_text(_json_dumps({
             "type": "session.created",
             "session": {
+                "id": state["session_id"],
+                "object": "realtime.session",
+                "model": state["api_model"],
                 "model_mode": state["model_mode"],
                 "mode": state["commit_mode"],
+                "voice": state["speaker"],
                 "speaker": state["speaker"],
                 "language": state["language"],
-                "response_format": "pcm_f32le",
+                "response_format": state["response_format"],
+                "sample_rate": state["sample_rate"],
             },
         }))
         try:
@@ -359,8 +373,10 @@ class RealtimeServer:
                         state["model_mode"] = session["model_mode"]
                     if session.get("mode"):
                         state["commit_mode"] = session["mode"]
-                    state["speaker"] = session.get("speaker", state["speaker"])
-                    state["language"] = session.get("language", state["language"])
+                    state["speaker"] = session.get("speaker") or session.get("voice") or state["speaker"]
+                    state["language"] = session.get("language") or session.get("language_type") or state["language"]
+                    state["response_format"] = session.get("response_format", state["response_format"])
+                    state["sample_rate"] = int(session.get("sample_rate", state["sample_rate"]))
                     state["stable_holdback_tokens"] = int(
                         session.get("stable_holdback_tokens", state["stable_holdback_tokens"])
                     )
@@ -415,6 +431,14 @@ async def realtime_tts(websocket: WebSocket):
     await SERVER.handle_ws(websocket)
 
 
+@app.websocket("/api-ws/v1/realtime")
+async def aliyun_compatible_realtime_tts(websocket: WebSocket):
+    if SERVER is None:
+        await websocket.close(code=1011)
+        return
+    await SERVER.handle_ws(websocket)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Ali-style realtime Qwen3-TTS WebSocket demo server.")
     parser.add_argument("--model", default="Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice")
@@ -440,10 +464,12 @@ def parse_args():
     parser.add_argument("--llm-base-url", default=None)
     parser.add_argument("--llm-api-key", default=None)
     parser.add_argument("--llm-model", default=None)
+    parser.add_argument("--llm-enable-thinking", action="store_true")
     args = parser.parse_args()
     args.llm_base_url = args.llm_base_url or os.environ.get("LLM_BASE_URL")
     args.llm_api_key = args.llm_api_key or os.environ.get("LLM_API_KEY")
     args.llm_model = args.llm_model or os.environ.get("LLM_MODEL")
+    args.llm_chat_template_kwargs = {"enable_thinking": bool(args.llm_enable_thinking)}
     return args
 
 
