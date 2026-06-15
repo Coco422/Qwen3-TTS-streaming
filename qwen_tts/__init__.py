@@ -18,7 +18,13 @@
 qwen_tts: Qwen-TTS package.
 """
 
-from .inference.qwen3_tts_model import Qwen3TTSModel, VoiceClonePromptItem
+from .inference.qwen3_tts_model import Qwen3TTSModel, RealtimeTextInputBuffer, VoiceClonePromptItem
 from .inference.qwen3_tts_tokenizer import Qwen3TTSTokenizer
 
-__all__ = ["__version__"]
+__all__ = [
+    "Qwen3TTSModel",
+    "Qwen3TTSTokenizer",
+    "RealtimeTextInputBuffer",
+    "VoiceClonePromptItem",
+    "__version__",
+]

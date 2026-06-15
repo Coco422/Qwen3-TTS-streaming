@@ -16,7 +16,7 @@ Added in this fork:
 - **Repetition penalty for streaming** - prevents token loops that cause looping audio and runaway generation. Defaults to 1.0 (disabled) because streaming generates frame-by-frame with CUDA graph constraints where repetition manifests differently than the non-streaming path (which defaults to 1.05)
 
 Added in Coco422 fork:
-- **Experimental realtime text input** - `stream_generate_voice_clone_realtime()` accepts appendable text chunks, e.g. LLM SSE deltas, and lets the TTS generation loop wait for more text hidden states instead of sentence-boundary chunking. Current prototype supports Base voice clone with `x_vector_only_mode=True`; ICL/ref-code prompting still requires full target text at prefill time.
+- **Experimental realtime text input** - `stream_generate_custom_voice_realtime()` and `stream_generate_voice_clone_realtime()` accept appendable text chunks, e.g. LLM SSE deltas, and let the TTS generation loop wait for more text hidden states instead of sentence-boundary chunking. The first recommended path is 12Hz CustomVoice; Base voice clone also works with `x_vector_only_mode=True`. ICL/ref-code prompting still requires full target text at prefill time.
 
 Experiments on branch: [wip/experimental](https://github.com/rekuenkdr/Qwen3-TTS-streaming/tree/wip/experimental)
 - **`generate_fast()` codebook predictor** - lightweight codebook generation that skips HuggingFace `generate()` overhead for the 31-step autoregressive loop (1.13x faster per-frame)
@@ -79,10 +79,18 @@ for chunk, sr in model.stream_generate_voice_clone(
 ## Realtime Text Input
 
 ```python
-for chunk, sr in model.stream_generate_voice_clone_realtime(
-    text_chunks=llm_sse_text_delta_iterable,
+from qwen_tts import RealtimeTextInputBuffer
+
+text_buffer = RealtimeTextInputBuffer()
+
+# From another thread/coroutine:
+text_buffer.append(llm_sse_delta)
+text_buffer.finish()
+
+for chunk, sr in model.stream_generate_custom_voice_realtime(
+    text_chunks=text_buffer,
+    speaker="Vivian",
     language="Auto",
-    voice_clone_prompt=prompt,
     emit_every_frames=8,
     decode_window_frames=80,
     first_chunk_emit_every=5,
@@ -90,7 +98,36 @@ for chunk, sr in model.stream_generate_voice_clone_realtime(
     play(chunk, sr)
 ```
 
-This path is intended for LLM SSE to TTS without waiting for punctuation or complete sentences. See `examples/test_realtime_text_stream.py` for a local iterator-based smoke test.
+Base voice-clone realtime uses the same appendable text path, but must avoid ICL/ref-code mode for now:
+
+```python
+for chunk, sr in model.stream_generate_voice_clone_realtime(
+    text_chunks=llm_sse_text_delta_iterable,
+    language="Auto",
+    voice_clone_prompt=prompt,
+    x_vector_only_mode=True,
+    emit_every_frames=8,
+    decode_window_frames=80,
+    first_chunk_emit_every=5,
+):
+    play(chunk, sr)
+```
+
+This path is intended for LLM SSE to TTS without waiting for punctuation or complete sentences. `stable_holdback_tokens` only holds back a tiny tokenizer tail so already-generated audio does not depend on an unstable BPE prefix. See `examples/test_realtime_text_stream.py` for a local iterator-based smoke test.
+
+### Realtime WebSocket Demo
+
+```bash
+python examples/realtime_ws_server.py \
+  --model Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice \
+  --mode custom \
+  --device cuda:0 \
+  --speaker Vivian \
+  --llm-base-url http://127.0.0.1:3398 \
+  --llm-model qwen3.6-27b
+```
+
+Open `http://127.0.0.1:7860`. The WebSocket accepts Ali-style events including `session.update`, `input_text_buffer.append`, `input_text_buffer.commit`, and `session.finish`; audio streams back as `response.audio.delta` with base64 `pcm_f32le` chunks.
 
 ## Streaming Parameters
 

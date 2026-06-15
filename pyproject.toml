@@ -23,6 +23,8 @@ dependencies = [
   "transformers>=4.57.3",
   "accelerate>=1.12.0",
   "gradio",
+  "fastapi",
+  "uvicorn[standard]",
   "librosa",
   "torchaudio",
   "soundfile",

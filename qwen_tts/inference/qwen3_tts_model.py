@@ -14,7 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import base64
+from collections import deque
 import io
+import threading
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple, Union
@@ -51,6 +53,49 @@ class VoiceClonePromptItem:
     ref_text: Optional[str] = None
 
 
+class RealtimeTextInputBuffer:
+    """Thread-safe append/finish text source for realtime TTS sessions."""
+
+    def __init__(self):
+        self._chunks = deque()
+        self._finished = False
+        self._error: Optional[BaseException] = None
+        self._cv = threading.Condition()
+
+    def append(self, text: str) -> None:
+        if not text:
+            return
+        with self._cv:
+            if self._finished:
+                raise RuntimeError("Cannot append text after finish")
+            self._chunks.append(text)
+            self._cv.notify_all()
+
+    def finish(self) -> None:
+        with self._cv:
+            self._finished = True
+            self._cv.notify_all()
+
+    def abort(self, error: Optional[BaseException] = None) -> None:
+        with self._cv:
+            self._error = error or RuntimeError("Realtime text input aborted")
+            self._finished = True
+            self._cv.notify_all()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> str:
+        with self._cv:
+            while not self._chunks and not self._finished and self._error is None:
+                self._cv.wait()
+            if self._error is not None:
+                raise self._error
+            if self._chunks:
+                return self._chunks.popleft()
+            raise StopIteration
+
+
 class _RealtimeTextHiddenProvider:
     def __init__(
         self,
@@ -59,6 +104,7 @@ class _RealtimeTextHiddenProvider:
         initial_text: str,
         initial_body_ids: torch.Tensor,
         source_done: bool = False,
+        stable_holdback_tokens: int = 1,
     ):
         self.owner = owner
         self.text_iter = iter(text_chunks)
@@ -66,10 +112,17 @@ class _RealtimeTextHiddenProvider:
         self.body_ids = initial_body_ids.detach().clone()
         self.source_done = source_done
         self.hidden: Optional[torch.Tensor] = None
+        self.stable_holdback_tokens = max(0, int(stable_holdback_tokens))
 
     def _body_ids_for_text(self, text: str) -> torch.Tensor:
         input_id = self.owner._tokenize_texts([self.owner._build_assistant_text(text)])[0]
         return input_id[:, 3:-5]
+
+    def _committable_body_ids(self, body_ids: torch.Tensor) -> torch.Tensor:
+        if self.source_done or self.stable_holdback_tokens == 0:
+            return body_ids
+        keep = max(0, body_ids.shape[1] - self.stable_holdback_tokens)
+        return body_ids[:, :keep]
 
     def _build_hidden(self, template: torch.Tensor) -> torch.Tensor:
         tail_ids = self.body_ids[:, 1:]
@@ -100,6 +153,15 @@ class _RealtimeTextHiddenProvider:
             chunk = next(self.text_iter)
         except StopIteration:
             self.source_done = True
+            final_body_ids = self._body_ids_for_text(self.text)
+            old_tokens = self.body_ids[0].tolist()
+            new_tokens = final_body_ids[0].tolist()
+            if new_tokens[:len(old_tokens)] != old_tokens:
+                raise RuntimeError(
+                    "Realtime TTS tokenizer prefix changed while finalizing text. "
+                    "Increase stable_holdback_tokens for this language/token stream."
+                )
+            self.body_ids = final_body_ids
             self.hidden = self._build_hidden(template)
             return
 
@@ -108,6 +170,10 @@ class _RealtimeTextHiddenProvider:
 
         self.text += chunk
         new_body_ids = self._body_ids_for_text(self.text)
+        new_body_ids = self._committable_body_ids(new_body_ids)
+        if new_body_ids.shape[1] == 0:
+            self.hidden = self._build_hidden(template)
+            return
         old_tokens = self.body_ids[0].tolist()
         new_tokens = new_body_ids[0].tolist()
         if new_tokens[:len(old_tokens)] != old_tokens:
@@ -413,6 +479,57 @@ class Qwen3TTSModel:
             input_id = input_id.unsqueeze(0) if input_id.dim() == 1 else input_id
             input_ids.append(input_id)
         return input_ids
+
+    def _prepare_realtime_text_inputs(
+        self,
+        text_chunks: Iterable[str],
+        stable_holdback_tokens: int = 1,
+    ) -> Tuple[torch.Tensor, _RealtimeTextHiddenProvider]:
+        source_iter = iter(text_chunks)
+        initial_text = ""
+        first_input_id = None
+        body_ids = None
+        source_done = False
+        stable_holdback_tokens = max(0, int(stable_holdback_tokens))
+
+        while body_ids is None or body_ids.shape[1] == 0:
+            try:
+                chunk = next(source_iter)
+            except StopIteration:
+                source_done = True
+                if not initial_text:
+                    raise ValueError("text_chunks ended before yielding any tokenizer-visible text")
+            else:
+                if not chunk:
+                    continue
+                initial_text += chunk
+
+            first_input_id = self._tokenize_texts([self._build_assistant_text(initial_text)])[0]
+            all_body_ids = first_input_id[:, 3:-5]
+            if source_done or stable_holdback_tokens == 0:
+                body_ids = all_body_ids
+            else:
+                keep = max(0, all_body_ids.shape[1] - stable_holdback_tokens)
+                body_ids = all_body_ids[:, :keep]
+
+            if source_done:
+                if body_ids.shape[1] == 0:
+                    raise ValueError("text_chunks did not contain tokenizer-visible text")
+                break
+
+        initial_input_id = torch.cat(
+            [first_input_id[:, :3], body_ids[:, :1], first_input_id[:, -5:]],
+            dim=1,
+        )
+        text_hidden_provider = _RealtimeTextHiddenProvider(
+            owner=self,
+            text_chunks=source_iter,
+            initial_text=initial_text,
+            initial_body_ids=body_ids,
+            source_done=source_done,
+            stable_holdback_tokens=stable_holdback_tokens,
+        )
+        return initial_input_id, text_hidden_provider
 
     def _merge_generate_kwargs(
         self,
@@ -925,6 +1042,7 @@ class Qwen3TTSModel:
         # Repetition penalty window
         repetition_penalty_window: int = 100,
         repetition_penalty: float = 1.0,
+        stable_holdback_tokens: int = 1,
         **kwargs,
     ) -> Generator[Tuple[np.ndarray, int], None, None]:
         """
@@ -967,30 +1085,9 @@ class Qwen3TTSModel:
                 "ICL/ref-code prompting consumes target text during prefill and is not appendable yet."
             )
 
-        source_iter = iter(text_chunks)
-        initial_text = ""
-        first_input_id = None
-        body_ids = None
-        while body_ids is None or body_ids.shape[1] == 0:
-            try:
-                chunk = next(source_iter)
-            except StopIteration:
-                raise ValueError("text_chunks ended before yielding any tokenizer-visible text")
-            if not chunk:
-                continue
-            initial_text += chunk
-            first_input_id = self._tokenize_texts([self._build_assistant_text(initial_text)])[0]
-            body_ids = first_input_id[:, 3:-5]
-
-        initial_input_id = torch.cat(
-            [first_input_id[:, :3], body_ids[:, :1], first_input_id[:, -5:]],
-            dim=1,
-        )
-        text_hidden_provider = _RealtimeTextHiddenProvider(
-            owner=self,
-            text_chunks=source_iter,
-            initial_text=initial_text,
-            initial_body_ids=body_ids,
+        initial_input_id, text_hidden_provider = self._prepare_realtime_text_inputs(
+            text_chunks=text_chunks,
+            stable_holdback_tokens=stable_holdback_tokens,
         )
 
         gen_kwargs = self._merge_generate_kwargs(**kwargs)
@@ -1367,6 +1464,82 @@ class Qwen3TTSModel:
 
         wavs, fs = self.model.speech_tokenizer.decode([{"audio_codes": c} for c in talker_codes_list])
         return wavs, fs
+
+    @torch.inference_mode()
+    def stream_generate_custom_voice_realtime(
+        self,
+        text_chunks: Iterable[str],
+        speaker: str,
+        language: str = None,
+        instruct: Optional[str] = None,
+        # Streaming control
+        emit_every_frames: int = 8,
+        decode_window_frames: int = 80,
+        overlap_samples: int = 512,
+        max_frames: int = 10000,
+        # Optimization
+        use_optimized_decode: bool = True,
+        # Two-phase streaming: aggressive first chunk
+        first_chunk_emit_every: int = 0,
+        first_chunk_decode_window: int = 48,
+        first_chunk_frames: int = 48,
+        # Repetition penalty window
+        repetition_penalty_window: int = 100,
+        repetition_penalty: float = 1.0,
+        stable_holdback_tokens: int = 1,
+        **kwargs,
+    ) -> Generator[Tuple[np.ndarray, int], None, None]:
+        """
+        Stream CustomVoice speech from appendable text chunks.
+
+        This is the simplest Qwen3-TTS realtime path because it uses a predefined
+        speaker id instead of reference-audio ICL context.
+        """
+        if self.model.tts_model_type != "custom_voice":
+            raise ValueError(
+                f"model with tts_model_type={self.model.tts_model_type} "
+                "does not support stream_generate_custom_voice_realtime"
+            )
+
+        language = language if language is not None else "Auto"
+        self._validate_languages([language])
+        self._validate_speakers([speaker])
+
+        if self.model.tts_model_size in "0b6":
+            instruct = None
+        instruct_ids = [None] if instruct is None or instruct == "" else [self._tokenize_texts([self._build_instruct_text(instruct)])[0]]
+        initial_input_id, text_hidden_provider = self._prepare_realtime_text_inputs(
+            text_chunks=text_chunks,
+            stable_holdback_tokens=stable_holdback_tokens,
+        )
+
+        gen_kwargs = self._merge_generate_kwargs(**kwargs)
+        supported_params = {
+            "do_sample", "top_k", "top_p", "temperature",
+            "subtalker_dosample", "subtalker_top_k", "subtalker_top_p", "subtalker_temperature",
+        }
+        gen_kwargs = {k: v for k, v in gen_kwargs.items() if k in supported_params}
+
+        for chunk, sr in self.model.stream_generate_pcm(
+            input_ids=[initial_input_id],
+            instruct_ids=instruct_ids,
+            languages=[language],
+            speakers=[speaker],
+            non_streaming_mode=False,
+            emit_every_frames=emit_every_frames,
+            decode_window_frames=decode_window_frames,
+            overlap_samples=overlap_samples,
+            max_frames=max_frames,
+            use_optimized_decode=use_optimized_decode,
+            first_chunk_emit_every=first_chunk_emit_every,
+            first_chunk_decode_window=first_chunk_decode_window,
+            first_chunk_frames=first_chunk_frames,
+            repetition_penalty=repetition_penalty,
+            repetition_penalty_window=repetition_penalty_window,
+            trailing_text_hidden_provider=text_hidden_provider,
+            **gen_kwargs,
+        ):
+            yield chunk, sr
 
 
     def get_supported_speakers(self) -> Optional[List[str]]:
