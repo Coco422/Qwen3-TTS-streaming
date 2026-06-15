@@ -125,6 +125,14 @@ python examples/realtime_ws_server.py \
   --mode custom \
   --device cuda:0 \
   --speaker Vivian \
+  --emit-every-frames 16 \
+  --decode-window-frames 64 \
+  --first-chunk-emit-every 1 \
+  --first-chunk-decode-window 8 \
+  --first-chunk-frames 2 \
+  --initial-buffer-chars 5 \
+  --fast-codebook \
+  --codebook-cuda-graph \
   --llm-base-url http://127.0.0.1:3398 \
   --llm-model qwen3.6-27b
 ```
@@ -132,6 +140,8 @@ python examples/realtime_ws_server.py \
 Open `http://127.0.0.1:7860`. The WebSocket accepts Ali-style events including `session.update`, `input_text_buffer.append`, `input_text_buffer.commit`, and `session.finish`; audio streams back as `response.audio.delta` with base64 `pcm_f32le` chunks. For drop-in Aliyun-style clients, use the compatible path `/api-ws/v1/realtime?model=qwen-tts-realtime`; the demo path `/v1/realtime/tts` remains available.
 
 The demo server enables startup warmup and a small tokenizer-stability front buffer by default. `--initial-buffer-chars 5` waits for only the first few LLM characters before starting TTS; this is not sentence splitting and subsequent LLM deltas keep streaming into the same TTS session. Diagnostic `response.timing.delta` events report model-side milestones such as prefill, first codec frame, and first decode.
+
+For low-latency local serving, `--fast-codebook --codebook-cuda-graph` captures the fixed-shape sub-codebook predictor loop inside the same single TTS worker thread that handles realtime requests. On an RTX 3090 with the 0.6B CustomVoice model, this path measured first server audio around 230-245 ms after TTS start and sustained RTF around 0.86-0.91 for the tested Chinese realtime sessions.
 
 For Qwen3 reasoning models served by vLLM, the LLM proxy sends `chat_template_kwargs: {"enable_thinking": false}` by default to keep first-token latency low. Pass `--llm-enable-thinking` only when you explicitly want reasoning output before TTS.
 
@@ -245,6 +255,7 @@ model.enable_streaming_optimizations(
 | `compile_mode` | "reduce-overhead" | torch.compile mode |
 | `use_fast_codebook` | False | Use fast codebook generation (experimental) |
 | `compile_codebook_predictor` | True | Apply torch.compile to codebook predictor |
+| `use_codebook_cuda_graph` | False | Prepare the sub-codebook predictor for manual CUDA graph capture in the generation worker thread |
 
 
 
