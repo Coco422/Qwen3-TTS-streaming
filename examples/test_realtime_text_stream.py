@@ -31,7 +31,7 @@ def parse_args():
     parser.add_argument("--text", default="你好，这是一个真正按文本流追加的实时语音合成测试。文本会像大模型 SSE 一样逐字到达。")
     parser.add_argument("--delay", type=float, default=0.03)
     parser.add_argument("--output", default="realtime_text_stream.wav")
-    parser.add_argument("--stable-holdback-tokens", type=int, default=1)
+    parser.add_argument("--stable-holdback-tokens", type=int, default=2)
     return parser.parse_args()
 
 

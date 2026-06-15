@@ -360,7 +360,7 @@ def parse_args():
     parser.add_argument("--first-chunk-emit-every", type=int, default=5)
     parser.add_argument("--first-chunk-decode-window", type=int, default=48)
     parser.add_argument("--first-chunk-frames", type=int, default=48)
-    parser.add_argument("--stable-holdback-tokens", type=int, default=1)
+    parser.add_argument("--stable-holdback-tokens", type=int, default=2)
     parser.add_argument("--llm-base-url", default=None)
     parser.add_argument("--llm-api-key", default=None)
     parser.add_argument("--llm-model", default=None)

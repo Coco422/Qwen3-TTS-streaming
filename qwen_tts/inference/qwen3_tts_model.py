@@ -104,7 +104,7 @@ class _RealtimeTextHiddenProvider:
         initial_text: str,
         initial_body_ids: torch.Tensor,
         source_done: bool = False,
-        stable_holdback_tokens: int = 1,
+        stable_holdback_tokens: int = 2,
     ):
         self.owner = owner
         self.text_iter = iter(text_chunks)
@@ -169,18 +169,24 @@ class _RealtimeTextHiddenProvider:
             return
 
         self.text += chunk
-        new_body_ids = self._body_ids_for_text(self.text)
-        new_body_ids = self._committable_body_ids(new_body_ids)
-        if new_body_ids.shape[1] == 0:
+        full_body_ids = self._body_ids_for_text(self.text)
+        old_tokens = self.body_ids[0].tolist()
+        full_tokens = full_body_ids[0].tolist()
+        if full_tokens[:len(old_tokens)] != old_tokens:
+            raise RuntimeError(
+                "Realtime TTS tokenizer prefix changed after audio generation started. "
+                "Increase stable_holdback_tokens or feed larger text deltas for this stream."
+            )
+
+        new_body_ids = self._committable_body_ids(full_body_ids)
+        if new_body_ids.shape[1] <= self.body_ids.shape[1]:
             self.hidden = self._build_hidden(template)
             return
-        old_tokens = self.body_ids[0].tolist()
         new_tokens = new_body_ids[0].tolist()
         if new_tokens[:len(old_tokens)] != old_tokens:
             raise RuntimeError(
-                "Realtime TTS tokenizer prefix changed after audio generation started. "
-                "For this prototype, feed stable text deltas such as CJK characters or "
-                "a tokenizer-stable queue."
+                "Realtime TTS tokenizer prefix changed inside the committable window. "
+                "Increase stable_holdback_tokens or feed larger text deltas for this stream."
             )
         self.body_ids = new_body_ids
         self.hidden = self._build_hidden(template)
@@ -483,7 +489,7 @@ class Qwen3TTSModel:
     def _prepare_realtime_text_inputs(
         self,
         text_chunks: Iterable[str],
-        stable_holdback_tokens: int = 1,
+        stable_holdback_tokens: int = 2,
     ) -> Tuple[torch.Tensor, _RealtimeTextHiddenProvider]:
         source_iter = iter(text_chunks)
         initial_text = ""
@@ -1042,7 +1048,7 @@ class Qwen3TTSModel:
         # Repetition penalty window
         repetition_penalty_window: int = 100,
         repetition_penalty: float = 1.0,
-        stable_holdback_tokens: int = 1,
+        stable_holdback_tokens: int = 2,
         **kwargs,
     ) -> Generator[Tuple[np.ndarray, int], None, None]:
         """
@@ -1486,7 +1492,7 @@ class Qwen3TTSModel:
         # Repetition penalty window
         repetition_penalty_window: int = 100,
         repetition_penalty: float = 1.0,
-        stable_holdback_tokens: int = 1,
+        stable_holdback_tokens: int = 2,
         **kwargs,
     ) -> Generator[Tuple[np.ndarray, int], None, None]:
         """

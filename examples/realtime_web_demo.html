@@ -247,7 +247,7 @@
           </div>
           <div>
             <label for="holdback">Holdback</label>
-            <input id="holdback" type="number" min="0" max="8" value="1">
+            <input id="holdback" type="number" min="0" max="8" value="2">
           </div>
         </div>
 
@@ -389,7 +389,7 @@
         session: {
           speaker: $("speaker").value.trim() || "Vivian",
           language: $("language").value.trim() || "Auto",
-          stable_holdback_tokens: Number($("holdback").value || 1)
+          stable_holdback_tokens: Number($("holdback").value || 2)
         }
       };
     }

@@ -113,7 +113,7 @@ for chunk, sr in model.stream_generate_voice_clone_realtime(
     play(chunk, sr)
 ```
 
-This path is intended for LLM SSE to TTS without waiting for punctuation or complete sentences. `stable_holdback_tokens` only holds back a tiny tokenizer tail so already-generated audio does not depend on an unstable BPE prefix. See `examples/test_realtime_text_stream.py` for a local iterator-based smoke test.
+This path is intended for LLM SSE to TTS without waiting for punctuation or complete sentences. `stable_holdback_tokens` only holds back a tiny tokenizer tail so already-generated audio does not depend on an unstable BPE prefix; the default is `2` to tolerate common Qwen tokenizer merges during character-by-character streams. See `examples/test_realtime_text_stream.py` for a local iterator-based smoke test.
 
 ### Realtime WebSocket Demo
 
