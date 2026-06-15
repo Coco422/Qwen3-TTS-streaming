@@ -91,9 +91,10 @@ for chunk, sr in model.stream_generate_custom_voice_realtime(
     text_chunks=text_buffer,
     speaker="Vivian",
     language="Auto",
-    emit_every_frames=8,
-    decode_window_frames=80,
-    first_chunk_emit_every=5,
+    emit_every_frames=4,
+    decode_window_frames=48,
+    first_chunk_emit_every=1,
+    first_chunk_decode_window=8,
 ):
     play(chunk, sr)
 ```
@@ -106,9 +107,10 @@ for chunk, sr in model.stream_generate_voice_clone_realtime(
     language="Auto",
     voice_clone_prompt=prompt,
     x_vector_only_mode=True,
-    emit_every_frames=8,
-    decode_window_frames=80,
-    first_chunk_emit_every=5,
+    emit_every_frames=4,
+    decode_window_frames=48,
+    first_chunk_emit_every=1,
+    first_chunk_decode_window=8,
 ):
     play(chunk, sr)
 ```
@@ -128,6 +130,8 @@ python examples/realtime_ws_server.py \
 ```
 
 Open `http://127.0.0.1:7860`. The WebSocket accepts Ali-style events including `session.update`, `input_text_buffer.append`, `input_text_buffer.commit`, and `session.finish`; audio streams back as `response.audio.delta` with base64 `pcm_f32le` chunks.
+
+The demo server enables startup warmup and a small tokenizer-stability front buffer by default. `--initial-buffer-chars 5` waits for only the first few LLM characters before starting TTS; this is not sentence splitting and subsequent LLM deltas keep streaming into the same TTS session. Diagnostic `response.timing.delta` events report model-side milestones such as prefill, first codec frame, and first decode.
 
 ## Streaming Parameters
 

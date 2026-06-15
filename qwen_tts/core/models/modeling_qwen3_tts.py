@@ -16,6 +16,7 @@
 
 import json
 import os
+import time
 from dataclasses import dataclass
 from typing import Callable, Optional, Generator
 
@@ -2639,6 +2640,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         first_chunk_frames: int = 48,  # Switch to stable after this many frames
         # Realtime text input: optional provider that can grow trailing_text_hiddens
         trailing_text_hidden_provider: Optional[Callable[[int, torch.Tensor], torch.Tensor]] = None,
+        timing_callback: Optional[Callable[[dict], None]] = None,
     ) -> Generator[tuple[np.ndarray, int], None, None]:
         """
         Stream audio generation, yielding PCM chunks as they are generated.
@@ -2670,10 +2672,23 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             trailing_text_hidden_provider: Optional callable for true realtime text input.
                 It receives (required_generation_step, current_trailing_text_hiddens) and must
                 return a tensor whose second dimension may grow as new text arrives.
+            timing_callback: Optional callable for lightweight diagnostic timing events.
 
         Yields:
             tuple[np.ndarray, int]: (pcm_chunk as float32 array, sample_rate)
         """
+        timing_start = time.time()
+
+        def emit_timing(name: str, **fields) -> None:
+            if timing_callback is None:
+                return
+            event = {
+                "name": name,
+                "model_elapsed_ms": round((time.time() - timing_start) * 1000, 2),
+            }
+            event.update(fields)
+            timing_callback(event)
+
         # Build talker inputs
         talker_input_embeds, talker_attention_mask, trailing_text_hiddens, tts_pad_embed = \
             self._build_talker_inputs(
@@ -2685,10 +2700,12 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                 speakers=speakers,
                 non_streaming_mode=non_streaming_mode,
             )
+        emit_timing("talker_inputs_built", trailing_text_len=int(trailing_text_hiddens.shape[1]))
         if trailing_text_hidden_provider is not None:
             if talker_input_embeds.shape[0] != 1:
                 raise ValueError("trailing_text_hidden_provider only supports single-sample streaming")
             trailing_text_hiddens = trailing_text_hidden_provider(-1, trailing_text_hiddens)
+            emit_timing("realtime_initial_text_hidden", trailing_text_len=int(trailing_text_hiddens.shape[1]))
 
         def refresh_trailing_text_hiddens(required_step: int) -> torch.Tensor:
             nonlocal trailing_text_hiddens
@@ -2735,6 +2752,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             subtalker_top_p=subtalker_top_p,
             subtalker_temperature=subtalker_temperature,
         )
+        emit_timing("prefill_done")
 
         past_key_values = out.past_key_values
         past_hidden = out.past_hidden
@@ -2748,6 +2766,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             token = _sample_next_token(last_logits, temperature, top_k, top_p, suppress_tokens)
         else:
             token = torch.argmax(last_logits, dim=-1)
+        emit_timing("first_token_sampled")
 
         # Extract ref_code for decoder context (if in ICL mode)
         # This provides stable context from the start, eliminating early voice artifacts
@@ -2796,6 +2815,8 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                 subtalker_top_p=subtalker_top_p,
                 subtalker_temperature=subtalker_temperature,
             )
+            if step_idx == 0:
+                emit_timing("first_codec_forward_done", generation_step=int(generation_step))
 
             # Update state for next iteration
             past_key_values = step_out.past_key_values
@@ -2876,6 +2897,14 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                 )
             else:
                 wavs, sr = self.speech_tokenizer.decode([{"audio_codes": window.to(self.talker.device)}])
+            if total_frames_emitted == 0:
+                emit_timing(
+                    "first_decode_done",
+                    generated_frames=len(codes_buffer),
+                    emit_every=current_emit_every,
+                    decode_window=current_decode_window,
+                    optimized=bool(current_use_optimized),
+                )
             # Debug removed for performance: decode time tracking
 
             wav = wavs[0].astype(np.float32)

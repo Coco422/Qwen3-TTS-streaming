@@ -19,7 +19,7 @@ import io
 import threading
 import urllib.request
 from dataclasses import dataclass
-from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Generator, Iterable, List, Optional, Tuple, Union
 from urllib.parse import urlparse
 
 import librosa
@@ -1049,6 +1049,7 @@ class Qwen3TTSModel:
         repetition_penalty_window: int = 100,
         repetition_penalty: float = 1.0,
         stable_holdback_tokens: int = 2,
+        timing_callback: Optional[Callable[[dict], None]] = None,
         **kwargs,
     ) -> Generator[Tuple[np.ndarray, int], None, None]:
         """
@@ -1095,6 +1096,8 @@ class Qwen3TTSModel:
             text_chunks=text_chunks,
             stable_holdback_tokens=stable_holdback_tokens,
         )
+        if timing_callback is not None:
+            timing_callback({"name": "realtime_text_ready"})
 
         gen_kwargs = self._merge_generate_kwargs(**kwargs)
         supported_params = {
@@ -1120,6 +1123,7 @@ class Qwen3TTSModel:
             repetition_penalty=repetition_penalty,
             repetition_penalty_window=repetition_penalty_window,
             trailing_text_hidden_provider=text_hidden_provider,
+            timing_callback=timing_callback,
             **gen_kwargs,
         ):
             yield chunk, sr
@@ -1493,6 +1497,7 @@ class Qwen3TTSModel:
         repetition_penalty_window: int = 100,
         repetition_penalty: float = 1.0,
         stable_holdback_tokens: int = 2,
+        timing_callback: Optional[Callable[[dict], None]] = None,
         **kwargs,
     ) -> Generator[Tuple[np.ndarray, int], None, None]:
         """
@@ -1518,6 +1523,8 @@ class Qwen3TTSModel:
             text_chunks=text_chunks,
             stable_holdback_tokens=stable_holdback_tokens,
         )
+        if timing_callback is not None:
+            timing_callback({"name": "realtime_text_ready"})
 
         gen_kwargs = self._merge_generate_kwargs(**kwargs)
         supported_params = {
@@ -1543,6 +1550,7 @@ class Qwen3TTSModel:
             repetition_penalty=repetition_penalty,
             repetition_penalty_window=repetition_penalty_window,
             trailing_text_hidden_provider=text_hidden_provider,
+            timing_callback=timing_callback,
             **gen_kwargs,
         ):
             yield chunk, sr

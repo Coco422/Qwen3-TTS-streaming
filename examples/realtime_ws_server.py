@@ -121,9 +121,35 @@ class RealtimeServer:
         self.text_buffer_cls = RealtimeTextInputBuffer
         self.generation_lock = threading.Lock()
         self.demo_html = Path(__file__).with_name("realtime_web_demo.html")
+        if not args.no_warmup:
+            self.warmup()
 
     def read_demo_html(self) -> str:
         return self.demo_html.read_text(encoding="utf-8")
+
+    def warmup(self) -> None:
+        started_at = time.time()
+        try:
+            if self.args.mode == "custom":
+                generator = self.model.stream_generate_custom_voice_realtime(
+                    text_chunks=iter([self.args.warmup_text]),
+                    speaker=self.args.speaker,
+                    language=self.args.language,
+                    emit_every_frames=self.args.emit_every_frames,
+                    decode_window_frames=self.args.decode_window_frames,
+                    overlap_samples=self.args.overlap_samples,
+                    first_chunk_emit_every=self.args.first_chunk_emit_every,
+                    first_chunk_decode_window=self.args.first_chunk_decode_window,
+                    first_chunk_frames=self.args.first_chunk_frames,
+                    stable_holdback_tokens=self.args.stable_holdback_tokens,
+                )
+            else:
+                return
+            next(generator)
+            generator.close()
+            print(f"Realtime warmup completed in {round((time.time() - started_at) * 1000, 2)} ms", flush=True)
+        except Exception as exc:
+            print(f"Realtime warmup failed: {type(exc).__name__}: {exc}", flush=True)
 
     async def handle_ws(self, websocket: WebSocket) -> None:
         await websocket.accept()
@@ -131,6 +157,7 @@ class RealtimeServer:
         out_queue: asyncio.Queue = asyncio.Queue()
         text_buffer = self.text_buffer_cls()
         threads = []
+        initial_lock = threading.Lock()
         state: Dict[str, Any] = {
             "model_mode": self.args.mode,
             "commit_mode": "server_commit",
@@ -139,6 +166,8 @@ class RealtimeServer:
             "started": False,
             "closed": False,
             "stable_holdback_tokens": self.args.stable_holdback_tokens,
+            "initial_text_buffer": "",
+            "initial_text_flushed": False,
         }
 
         def enqueue(event: Dict[str, Any]) -> None:
@@ -163,6 +192,15 @@ class RealtimeServer:
             first_audio_sent = False
             try:
                 enqueue({"type": "response.created"})
+
+                def timing_callback(event: Dict[str, Any]) -> None:
+                    payload = {
+                        "type": "response.timing.delta",
+                        "request_elapsed_ms": round((time.time() - started_at) * 1000, 2),
+                    }
+                    payload.update(event)
+                    enqueue(payload)
+
                 stream_kwargs = dict(
                     text_chunks=text_buffer,
                     language=state["language"],
@@ -173,6 +211,7 @@ class RealtimeServer:
                     first_chunk_decode_window=self.args.first_chunk_decode_window,
                     first_chunk_frames=self.args.first_chunk_frames,
                     stable_holdback_tokens=state["stable_holdback_tokens"],
+                    timing_callback=timing_callback,
                 )
                 if state["model_mode"] == "custom":
                     generator = self.model.stream_generate_custom_voice_realtime(
@@ -221,6 +260,40 @@ class RealtimeServer:
             threads.append(thread)
             thread.start()
 
+        def flush_initial_text_locked() -> None:
+            pending = state.get("initial_text_buffer", "")
+            if pending:
+                text_buffer.append(pending)
+                enqueue({
+                    "type": "input_text_buffer.initial_flushed",
+                    "chars": len(pending),
+                })
+                start_tts_once()
+            state["initial_text_buffer"] = ""
+            state["initial_text_flushed"] = True
+
+        def append_text_delta(text: str, force: bool = False) -> None:
+            if not text and not force:
+                return
+            with initial_lock:
+                if (
+                    not state["started"]
+                    and not state["initial_text_flushed"]
+                    and self.args.initial_buffer_chars > 0
+                ):
+                    state["initial_text_buffer"] += text
+                    if force or len(state["initial_text_buffer"]) >= self.args.initial_buffer_chars:
+                        flush_initial_text_locked()
+                    else:
+                        enqueue({
+                            "type": "input_text_buffer.initial_buffered",
+                            "chars": len(state["initial_text_buffer"]),
+                        })
+                    return
+                if text:
+                    text_buffer.append(text)
+                start_tts_once()
+
         def run_llm_sse(payload: Dict[str, Any]) -> None:
             if not self.args.llm_base_url or not self.args.llm_model:
                 text_buffer.abort(RuntimeError("LLM SSE proxy is not configured on the server"))
@@ -243,8 +316,9 @@ class RealtimeServer:
                     temperature=payload.get("temperature"),
                 ):
                     enqueue({"type": "response.text.delta", "delta": delta})
-                    text_buffer.append(delta)
+                    append_text_delta(delta)
                 enqueue({"type": "response.text.done"})
+                append_text_delta("", force=True)
                 text_buffer.finish()
             except (urllib.error.URLError, TimeoutError, Exception) as exc:
                 text_buffer.abort(exc)
@@ -293,17 +367,16 @@ class RealtimeServer:
                     enqueue({"type": "session.updated", "session": dict(state)})
                 elif event_type == "input_text_buffer.append":
                     text = event.get("text") or event.get("delta") or ""
-                    text_buffer.append(text)
-                    start_tts_once()
+                    append_text_delta(text)
                     enqueue({"type": "input_text_buffer.appended"})
                 elif event_type == "input_text_buffer.commit":
-                    start_tts_once()
+                    append_text_delta("", force=True)
                     enqueue({"type": "input_text_buffer.committed"})
                 elif event_type == "session.finish":
+                    append_text_delta("", force=True)
                     text_buffer.finish()
                     enqueue({"type": "session.finish.received"})
                 elif event_type == "llm.sse.start":
-                    start_tts_once()
                     thread = threading.Thread(target=run_llm_sse, args=(event,), daemon=True)
                     threads.append(thread)
                     thread.start()
@@ -354,13 +427,16 @@ def parse_args():
     parser.add_argument("--port", type=int, default=7860)
     parser.add_argument("--speaker", default="Vivian")
     parser.add_argument("--language", default="Auto")
-    parser.add_argument("--emit-every-frames", type=int, default=8)
-    parser.add_argument("--decode-window-frames", type=int, default=80)
-    parser.add_argument("--overlap-samples", type=int, default=512)
-    parser.add_argument("--first-chunk-emit-every", type=int, default=5)
-    parser.add_argument("--first-chunk-decode-window", type=int, default=48)
-    parser.add_argument("--first-chunk-frames", type=int, default=48)
+    parser.add_argument("--emit-every-frames", type=int, default=4)
+    parser.add_argument("--decode-window-frames", type=int, default=48)
+    parser.add_argument("--overlap-samples", type=int, default=256)
+    parser.add_argument("--first-chunk-emit-every", type=int, default=1)
+    parser.add_argument("--first-chunk-decode-window", type=int, default=8)
+    parser.add_argument("--first-chunk-frames", type=int, default=16)
     parser.add_argument("--stable-holdback-tokens", type=int, default=2)
+    parser.add_argument("--no-warmup", action="store_true")
+    parser.add_argument("--warmup-text", default="你好，实时语音热身。")
+    parser.add_argument("--initial-buffer-chars", type=int, default=5)
     parser.add_argument("--llm-base-url", default=None)
     parser.add_argument("--llm-api-key", default=None)
     parser.add_argument("--llm-model", default=None)
