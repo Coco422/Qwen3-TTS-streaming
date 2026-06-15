@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import sys
@@ -122,8 +123,21 @@ class RealtimeServer:
             dtype=_torch_dtype(args.dtype),
             attn_implementation=None if args.no_flash_attn else "flash_attention_2",
         )
+        if args.fast_codebook or args.compile_decoder or args.compile_codebook_predictor or args.codebook_cuda_graph:
+            self.model.enable_streaming_optimizations(
+                decode_window_frames=args.decode_window_frames,
+                use_compile=args.compile_decoder or args.compile_codebook_predictor,
+                use_cuda_graphs=args.cuda_graph_decoder,
+                compile_mode=args.compile_mode,
+                use_fast_codebook=args.fast_codebook or args.codebook_cuda_graph,
+                compile_codebook_predictor=args.compile_codebook_predictor,
+                use_codebook_cuda_graph=args.codebook_cuda_graph,
+            )
         self.text_buffer_cls = RealtimeTextInputBuffer
         self.generation_lock = threading.Lock()
+        self.tts_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="qwen-tts-worker")
+        self.codebook_graph_captured = False
+        self.codebook_graph_failed = False
         self.demo_html = Path(__file__).with_name("realtime_web_demo.html")
         if not args.no_warmup:
             self.warmup()
@@ -131,9 +145,47 @@ class RealtimeServer:
     def read_demo_html(self) -> str:
         return self.demo_html.read_text(encoding="utf-8")
 
-    def warmup(self) -> None:
+    def _maybe_capture_codebook_graph(self, enqueue=None, request_started_at: Optional[float] = None) -> None:
+        if not self.args.codebook_cuda_graph or self.codebook_graph_captured or self.codebook_graph_failed:
+            return
         started_at = time.time()
         try:
+            if enqueue is not None and request_started_at is not None:
+                enqueue({
+                    "type": "response.timing.delta",
+                    "name": "codebook_cuda_graph_capture_started",
+                    "request_elapsed_ms": round((time.time() - request_started_at) * 1000, 2),
+                })
+            self.model.capture_codebook_cuda_graph(
+                warmup_runs=self.args.codebook_graph_warmup_runs,
+                temperature=0.9,
+                top_k=50,
+            )
+            self.codebook_graph_captured = True
+            elapsed_ms = round((time.time() - started_at) * 1000, 2)
+            print(f"Codebook CUDA graph captured in {elapsed_ms} ms", flush=True)
+            if enqueue is not None and request_started_at is not None:
+                enqueue({
+                    "type": "response.timing.delta",
+                    "name": "codebook_cuda_graph_captured",
+                    "request_elapsed_ms": round((time.time() - request_started_at) * 1000, 2),
+                    "capture_ms": elapsed_ms,
+                })
+        except Exception as exc:
+            self.codebook_graph_failed = True
+            print(f"Codebook CUDA graph capture failed; falling back: {type(exc).__name__}: {exc}", flush=True)
+            if enqueue is not None and request_started_at is not None:
+                enqueue({
+                    "type": "response.timing.delta",
+                    "name": "codebook_cuda_graph_failed",
+                    "request_elapsed_ms": round((time.time() - request_started_at) * 1000, 2),
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+
+    def _warmup_impl(self) -> None:
+        started_at = time.time()
+        try:
+            self._maybe_capture_codebook_graph()
             if self.args.mode == "custom":
                 generator = self.model.stream_generate_custom_voice_realtime(
                     text_chunks=iter([self.args.warmup_text]),
@@ -154,6 +206,9 @@ class RealtimeServer:
             print(f"Realtime warmup completed in {round((time.time() - started_at) * 1000, 2)} ms", flush=True)
         except Exception as exc:
             print(f"Realtime warmup failed: {type(exc).__name__}: {exc}", flush=True)
+
+    def warmup(self) -> None:
+        self.tts_executor.submit(self._warmup_impl).result()
 
     async def handle_ws(self, websocket: WebSocket) -> None:
         await websocket.accept()
@@ -200,6 +255,7 @@ class RealtimeServer:
             first_audio_sent = False
             try:
                 enqueue({"type": "response.created"})
+                self._maybe_capture_codebook_graph(enqueue=enqueue, request_started_at=started_at)
 
                 def timing_callback(event: Dict[str, Any]) -> None:
                     payload = {
@@ -264,9 +320,7 @@ class RealtimeServer:
             if state["started"]:
                 return
             state["started"] = True
-            thread = threading.Thread(target=run_tts, daemon=True)
-            threads.append(thread)
-            thread.start()
+            self.tts_executor.submit(run_tts)
 
         def flush_initial_text_locked() -> None:
             pending = state.get("initial_text_buffer", "")
@@ -458,6 +512,13 @@ def parse_args():
     parser.add_argument("--first-chunk-decode-window", type=int, default=8)
     parser.add_argument("--first-chunk-frames", type=int, default=16)
     parser.add_argument("--stable-holdback-tokens", type=int, default=2)
+    parser.add_argument("--fast-codebook", action="store_true")
+    parser.add_argument("--compile-decoder", action="store_true")
+    parser.add_argument("--cuda-graph-decoder", action="store_true")
+    parser.add_argument("--compile-codebook-predictor", action="store_true")
+    parser.add_argument("--compile-mode", default="reduce-overhead")
+    parser.add_argument("--codebook-cuda-graph", action="store_true")
+    parser.add_argument("--codebook-graph-warmup-runs", type=int, default=3)
     parser.add_argument("--no-warmup", action="store_true")
     parser.add_argument("--warmup-text", default="你好，实时语音热身。")
     parser.add_argument("--initial-buffer-chars", type=int, default=5)

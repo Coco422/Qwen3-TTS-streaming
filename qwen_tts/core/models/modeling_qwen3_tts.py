@@ -28,7 +28,7 @@ from librosa.filters import mel as librosa_mel_fn
 from torch import nn
 from torch.nn import functional as F
 from transformers.activations import ACT2FN
-from transformers.cache_utils import Cache, DynamicCache
+from transformers.cache_utils import Cache, DynamicCache, StaticCache
 from transformers.generation import GenerationMixin
 from transformers.integrations import use_kernel_forward_from_hub
 from transformers.masking_utils import (create_causal_mask,
@@ -1417,14 +1417,14 @@ class Qwen3TTSTalkerCodePredictorModelForConditionalGeneration(Qwen3TTSPreTraine
         """
         Fast generation that bypasses HuggingFace's generate() overhead.
 
-        This is ~2-3x faster than using generate() because:
+        This is faster than using generate() because:
         1. No GenerationMixin overhead (config creation, stopping criteria, etc.)
-        2. Direct forward calls with minimal wrapper logic
-        3. Simple KV-cache management
+        2. Direct forward calls with explicit cache_position
+        3. Pre-created DynamicCache avoids per-step generate() allocation overhead
 
         Args:
             inputs_embeds: Initial embeddings [B, 2, hidden_size] (past_hidden + first_token_embed)
-            num_codebooks: Number of codebook tokens to generate (typically 7)
+            num_codebooks: Number of codebook tokens to generate
             do_sample: Whether to sample or use greedy decoding
             temperature: Sampling temperature
             top_k: Top-k filtering
@@ -1433,25 +1433,41 @@ class Qwen3TTSTalkerCodePredictorModelForConditionalGeneration(Qwen3TTSPreTraine
         Returns:
             Generated token IDs [B, num_codebooks]
         """
-        batch_size = inputs_embeds.shape[0]
+        if (
+            getattr(self, "_has_codebook_cuda_graph", False)
+            and do_sample
+            and top_p >= 1.0
+            and int(top_k) == int(getattr(self, "_cg_top_k", -1))
+            and abs(float(temperature) - float(getattr(self, "_cg_temperature", -1.0))) < 1e-6
+        ):
+            self._cg_inputs_embeds.copy_(inputs_embeds)
+            self._cg_cache.reset()
+            self._cg_graph.replay()
+            return self._cg_output_tokens.clone()
+
         device = inputs_embeds.device
 
         # Project inputs
         inputs_embeds = self.small_to_mtp_projection(inputs_embeds)
 
-        # Prefill: process initial embeddings
+        past_key_values = DynamicCache()
+
+        # Prefill: process initial embeddings with explicit cache positions.
+        cache_position = torch.arange(0, inputs_embeds.shape[1], device=device)
         outputs = self.model(
             input_ids=None,
             inputs_embeds=inputs_embeds,
+            past_key_values=past_key_values,
             use_cache=True,
             output_hidden_states=False,
+            cache_position=cache_position,
         )
         past_key_values = outputs.past_key_values
         hidden_states = outputs.last_hidden_state
+        next_pos = inputs_embeds.shape[1]
 
         # Generate tokens for each codebook
         generated_tokens = []
-        generation_step = 0  # Start from codebook 1 (index 0 in lm_head)
 
         for step in range(num_codebooks):
             # Get logits for current codebook
@@ -1494,6 +1510,9 @@ class Qwen3TTSTalkerCodePredictorModelForConditionalGeneration(Qwen3TTSPreTraine
             next_embeds = self.model.get_input_embeddings()[step](next_token)
             next_embeds = self.small_to_mtp_projection(next_embeds)
 
+            cache_position = torch.tensor([next_pos], device=device)
+            next_pos += 1
+
             # Forward pass for next position
             outputs = self.model(
                 input_ids=None,
@@ -1501,12 +1520,143 @@ class Qwen3TTSTalkerCodePredictorModelForConditionalGeneration(Qwen3TTSPreTraine
                 past_key_values=past_key_values,
                 use_cache=True,
                 output_hidden_states=False,
+                cache_position=cache_position,
             )
             past_key_values = outputs.past_key_values
             hidden_states = outputs.last_hidden_state
 
         # Concatenate all generated tokens
         return torch.cat(generated_tokens, dim=-1)  # [B, num_codebooks]
+
+    def prepare_fast_weights(self):
+        """Prepare stacked weights used by the CUDA graph codebook path."""
+        device = next(self.parameters()).device
+        dtype = next(self.parameters()).dtype
+
+        self._stacked_lm_head_weight = torch.stack(
+            [h.weight for h in self.lm_head], dim=0
+        )
+        self._stacked_codec_embedding_weight = torch.stack(
+            [e.weight for e in self.model.codec_embedding], dim=0
+        )
+
+        max_cache_len = 2 + (self.config.num_code_groups - 1)
+        self._static_cache = StaticCache(
+            config=self.config,
+            max_batch_size=1,
+            max_cache_len=max_cache_len,
+            device=device,
+            dtype=dtype,
+        )
+
+    def _generate_fast_inner(self):
+        """Fixed-shape codebook generation loop used during CUDA graph capture."""
+        num_codebooks = self._cg_num_codebooks
+
+        inputs_embeds = self.small_to_mtp_projection(self._cg_inputs_embeds)
+        cache_position = self._cg_cache_positions[:2]
+        outputs = self.model(
+            input_ids=None,
+            inputs_embeds=inputs_embeds,
+            past_key_values=self._cg_cache,
+            use_cache=True,
+            output_hidden_states=False,
+            cache_position=cache_position,
+        )
+        hidden_states = outputs.last_hidden_state
+
+        for step in range(num_codebooks):
+            h = hidden_states[:, -1, :]
+            logits = F.linear(h, self._stacked_lm_head_weight[step])
+            logits = logits / self._cg_temperature
+            top_k_val = self._cg_top_k
+            indices_to_remove = logits < torch.topk(logits, top_k_val)[0][..., -1, None]
+            logits = logits.masked_fill(indices_to_remove, float("-inf"))
+            probs = F.softmax(logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+
+            self._cg_output_tokens[:, step:step + 1] = next_token
+
+            if step < num_codebooks - 1:
+                next_embeds = F.embedding(
+                    next_token, self._stacked_codec_embedding_weight[step]
+                )
+                next_embeds = self.small_to_mtp_projection(next_embeds)
+                cache_position = self._cg_cache_positions[step + 2:step + 3]
+
+                outputs = self.model(
+                    input_ids=None,
+                    inputs_embeds=next_embeds,
+                    past_key_values=self._cg_cache,
+                    use_cache=True,
+                    output_hidden_states=False,
+                    cache_position=cache_position,
+                )
+                hidden_states = outputs.last_hidden_state
+
+    def capture_codebook_cuda_graph(
+        self,
+        warmup_runs: int = 3,
+        temperature: float = 0.9,
+        top_k: int = 50,
+    ):
+        """
+        Capture the full sub-codebook generation loop as one CUDA graph.
+
+        The graph is replayed only when generate_fast() is called with matching
+        sampling settings, otherwise generate_fast() falls back to the dynamic path.
+        """
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA is required for codebook CUDA graph capture")
+
+        if not hasattr(self, "_stacked_lm_head_weight"):
+            self.prepare_fast_weights()
+
+        device = next(self.parameters()).device
+        dtype = next(self.parameters()).dtype
+        num_codebooks = self.config.num_code_groups - 1
+
+        if isinstance(self.small_to_mtp_projection, torch.nn.Linear):
+            input_hidden_size = self.small_to_mtp_projection.in_features
+        else:
+            input_hidden_size = self.config.hidden_size
+
+        self._cg_num_codebooks = num_codebooks
+        self._cg_temperature = float(temperature)
+        self._cg_top_k = min(int(top_k), self.config.vocab_size)
+        self._cg_inputs_embeds = torch.randn(
+            1, 2, input_hidden_size, device=device, dtype=dtype
+        )
+        self._cg_output_tokens = torch.zeros(
+            1, num_codebooks, dtype=torch.long, device=device
+        )
+        self._cg_cache_positions = torch.arange(
+            0, 2 + num_codebooks, device=device, dtype=torch.long
+        )
+
+        self._cg_cache = StaticCache(
+            config=self.config,
+            max_batch_size=1,
+            max_cache_len=2 + num_codebooks,
+            device=device,
+            dtype=dtype,
+        )
+        self._cg_pool = torch.cuda.graph_pool_handle()
+
+        warmup_stream = torch.cuda.Stream()
+        warmup_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warmup_stream):
+            for _ in range(warmup_runs):
+                self._cg_cache.reset()
+                self._generate_fast_inner()
+        torch.cuda.current_stream().wait_stream(warmup_stream)
+
+        self._cg_graph = torch.cuda.CUDAGraph()
+        self._cg_cache.reset()
+        with torch.cuda.graph(self._cg_graph, pool=self._cg_pool):
+            self._generate_fast_inner()
+
+        self._has_codebook_cuda_graph = True
 
     def enable_compile(self, mode: str = "reduce-overhead"):
         """
@@ -1515,6 +1665,7 @@ class Qwen3TTSTalkerCodePredictorModelForConditionalGeneration(Qwen3TTSPreTraine
         This compiles the inner model forward pass for faster execution.
         Should be called once after model loading.
         """
+        self.prepare_fast_weights()
         self.model.forward = torch.compile(
             self.model.forward,
             mode=mode,
@@ -2094,6 +2245,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         compile_mode: str = "reduce-overhead",
         use_fast_codebook: bool = False,  # Disabled: needs debugging, currently slower
         compile_codebook_predictor: bool = True,
+        use_codebook_cuda_graph: bool = False,
     ):
         """
         Enable torch.compile and CUDA graphs optimizations for streaming decode.
@@ -2109,6 +2261,9 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             compile_mode: torch.compile mode ("reduce-overhead" recommended)
             use_fast_codebook: Use fast codebook generation (bypasses HF generate() overhead)
             compile_codebook_predictor: Apply torch.compile to codebook predictor (default True)
+            use_codebook_cuda_graph: Prepare fixed-shape codebook weights for manual
+                                     CUDA graph capture. Capture must happen in the
+                                     same worker thread that will replay it.
 
         Returns:
             self for method chaining
@@ -2129,16 +2284,34 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         )
 
         # Enable fast codebook generation (bypasses HuggingFace generate() overhead)
-        if use_fast_codebook:
+        if use_fast_codebook or use_codebook_cuda_graph:
             print("[Talker] Enabling fast codebook generation...")
             self.talker.enable_fast_codebook_gen(True)
 
         # Compile codebook predictor for faster inference
-        if compile_codebook_predictor and use_compile:
+        if compile_codebook_predictor and use_compile and not use_codebook_cuda_graph:
             print(f"[CodePredictor] Compiling model with mode={compile_mode}...")
             self.talker.code_predictor.enable_compile(mode=compile_mode)
+        elif use_codebook_cuda_graph:
+            print("[CodePredictor] Preparing fast weights for CUDA graph capture...")
+            self.talker.code_predictor.prepare_fast_weights()
 
         return self
+
+    def capture_codebook_cuda_graph(
+        self,
+        warmup_runs: int = 3,
+        temperature: float = 0.9,
+        top_k: int = 50,
+    ):
+        """Capture the codebook predictor CUDA graph in the current worker thread."""
+        print("[CodePredictor] Capturing CUDA graph for codebook generation...")
+        self.talker.code_predictor.capture_codebook_cuda_graph(
+            warmup_runs=warmup_runs,
+            temperature=temperature,
+            top_k=top_k,
+        )
+        print("[CodePredictor] CUDA graph captured successfully")
 
     @classmethod
     def from_pretrained(
@@ -2767,6 +2940,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         else:
             token = torch.argmax(last_logits, dim=-1)
         emit_timing("first_token_sampled")
+        eos_token_tensor = torch.tensor(sorted(eos_ids), device=token.device, dtype=torch.long)
 
         # Extract ref_code for decoder context (if in ICL mode)
         # This provides stable context from the start, eliminating early voice artifacts
@@ -2785,6 +2959,9 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         decoded_tail: Optional[np.ndarray] = None
         frames_since_emit = 0
         total_frames_emitted = 0  # Track how many frames we've already emitted audio for
+        pending_eos_flags: list[torch.Tensor] = []
+        chunk_index = 0
+        chunk_compute_start = time.time()
 
         # GPU-resident circular buffer for repetition penalty
         if repetition_penalty != 1.0:
@@ -2826,13 +3003,12 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             # Get codec_ids from hidden_states tuple: (layer_outputs, codec_ids)
             codec_ids = step_out.hidden_states[1]  # [B, num_code_groups]
 
-            # Check for EOS in first codebook
-            # EOS token is out of range for speech tokenizer, so we must not include it
-            if codec_ids[0, 0].item() in eos_ids:
-                break
-
             # Keep on GPU to avoid CPU<->GPU transfers during decode
             codes_buffer.append(codec_ids[0].detach())
+            # EOS tokens are out of range for the speech tokenizer, but checking
+            # `.item()` every frame forces a GPU/CPU sync. Keep the flag on GPU
+            # and synchronize only at chunk boundaries, then trim before decode.
+            pending_eos_flags.append((codec_ids[0, 0].long() == eos_token_tensor).any())
 
             # Sample next token for first codebook
             step_logits = step_out.logits[:, -1, :]
@@ -2878,6 +3054,22 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                 continue
             frames_since_emit = 0
 
+            stop_after_emit = False
+            if pending_eos_flags:
+                pending_start = len(codes_buffer) - len(pending_eos_flags)
+                eos_flags = torch.stack(pending_eos_flags).detach().cpu().numpy()
+                pending_eos_flags = []
+                eos_positions = np.flatnonzero(eos_flags)
+                if eos_positions.size > 0:
+                    keep_total = pending_start + int(eos_positions[0])
+                    if keep_total < len(codes_buffer):
+                        del codes_buffer[keep_total:]
+                    stop_after_emit = True
+                    if len(codes_buffer) <= total_frames_emitted:
+                        break
+
+            new_frames_for_chunk = len(codes_buffer) - total_frames_emitted
+
             # Decode window of codec frames to PCM
             start = max(0, len(codes_buffer) - current_decode_window)
             window_codes = torch.stack(codes_buffer[start:], dim=0)  # [T, num_code_groups]
@@ -2889,6 +3081,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
 
             # Use optimized decode path when available
             # Pass pad_to_size to ensure fixed tensor size for torch.compile
+            decode_start = time.time()
             if current_use_optimized and hasattr(self.speech_tokenizer, 'decode_streaming'):
                 wavs, sr = self.speech_tokenizer.decode_streaming(
                     window.to(self.talker.device),
@@ -2897,6 +3090,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                 )
             else:
                 wavs, sr = self.speech_tokenizer.decode([{"audio_codes": window.to(self.talker.device)}])
+            decode_ms = round((time.time() - decode_start) * 1000, 2)
             if total_frames_emitted == 0:
                 emit_timing(
                     "first_decode_done",
@@ -2912,7 +3106,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             # Extract only new samples (tail of decoded window)
             # Use fixed upsample rate to avoid floating-point drift
             samples_per_frame = self.speech_tokenizer.get_decode_upsample_rate()
-            step_samples = samples_per_frame * current_emit_every
+            step_samples = samples_per_frame * new_frames_for_chunk
             chunk = wav[-step_samples:] if step_samples > 0 else wav
 
             # Crossfade with previous chunk tail for smooth transition
@@ -2943,7 +3137,25 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                 chunk = chunk[:-blend_samples]
 
             total_frames_emitted = len(codes_buffer)  # Mark these frames as emitted
+            emit_timing(
+                "audio_chunk_ready",
+                chunk_index=chunk_index,
+                generated_frames=len(codes_buffer),
+                new_frames=new_frames_for_chunk,
+                chunk_samples=int(len(chunk)),
+                chunk_audio_ms=round(len(chunk) / sr * 1000, 2),
+                emit_every=current_emit_every,
+                decode_window=current_decode_window,
+                optimized=bool(current_use_optimized),
+                decode_ms=decode_ms,
+                chunk_wall_ms=round((time.time() - chunk_compute_start) * 1000, 2),
+                stop_after_emit=bool(stop_after_emit),
+            )
+            chunk_index += 1
             yield chunk, sr
+            if stop_after_emit:
+                break
+            chunk_compute_start = time.time()
 
         # Flush: decode only remaining frames that haven't been emitted yet
         remaining_frames = len(codes_buffer) - total_frames_emitted
@@ -2958,7 +3170,9 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                 window_codes, ref_code_context, ref_code_frames, decode_window_frames
             )
 
+            decode_start = time.time()
             wavs, sr = self.speech_tokenizer.decode([{"audio_codes": window.to(self.talker.device)}])
+            decode_ms = round((time.time() - decode_start) * 1000, 2)
             wav = wavs[0].astype(np.float32)
 
             # Extract only the new samples (skip ref_code and context portions)
@@ -2985,6 +3199,20 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                 wav[-fade_len:] *= fade_out
 
             # Debug removed for performance: flush done
+            emit_timing(
+                "audio_chunk_ready",
+                chunk_index=chunk_index,
+                generated_frames=len(codes_buffer),
+                new_frames=remaining_frames,
+                chunk_samples=int(len(wav)),
+                chunk_audio_ms=round(len(wav) / sr * 1000, 2),
+                emit_every=remaining_frames,
+                decode_window=decode_window_frames,
+                optimized=False,
+                decode_ms=decode_ms,
+                chunk_wall_ms=round((time.time() - chunk_compute_start) * 1000, 2),
+                flush=True,
+            )
             yield wav, sr
 
 
