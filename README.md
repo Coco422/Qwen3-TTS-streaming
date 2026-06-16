@@ -78,6 +78,11 @@ for chunk, sr in model.stream_generate_voice_clone(
 
 ## Realtime Text Input
 
+Architecture and operations notes:
+
+- [Realtime architecture](docs/realtime-architecture.md) explains how appendable text input, hidden-state extension, PCM chunk emission, and the Ali-style WebSocket path work.
+- [Realtime deployment runbook](docs/deployment-runbook.md) records the tested 3090/4090 deployment shape, benchmark results, concurrency model, flash-attn notes, and operational commands.
+
 ```python
 from qwen_tts import RealtimeTextInputBuffer
 
